@@ -1,0 +1,9 @@
+{
+  "name": "pocket-watch",
+  "version": "0.1.0",
+  "description": "Temporal awareness and estimate calibration for Claude Code",
+  "homepage": "https://github.com/MiguelDotL/pocket-watch",
+  "author": { "name": "MiguelDotL" },
+  "license": "MIT",
+  "min_claude_code_version": "1.0.0"
+}

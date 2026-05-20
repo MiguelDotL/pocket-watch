@@ -1,0 +1,553 @@
+#!/usr/bin/env python3
+"""pocket-watch CLI.
+
+Usage: pw <subcommand> [options]
+
+Subcommands:
+  now [--json] [--pretty] [--offset <±Nd|±Nh|±Nm>]
+  estimate <duration> [--category <cat>] [--note <text>]
+  done [<active_minutes>] [--status completed|cancelled|merged|scope-changed]
+  stats [--category <cat>] [--json]
+  doctor [--enable-hooks] [--json]
+  audit [--skip] [--accept-all]
+  correct <id> <field> <value>
+  correct <id> --delete
+"""
+
+from __future__ import annotations
+
+import argparse
+import datetime
+import json
+import os
+import sys
+import uuid
+
+# Ensure scripts/ is importable via CLAUDE_PLUGIN_ROOT or relative path
+_PLUGIN_ROOT = os.environ.get("CLAUDE_PLUGIN_ROOT", "")
+if _PLUGIN_ROOT:
+    sys.path.insert(0, os.path.join(_PLUGIN_ROOT, "scripts"))
+else:
+    _script_dir = os.path.dirname(os.path.abspath(__file__))
+    sys.path.insert(0, _script_dir)
+
+
+# ---------------------------------------------------------------------------
+# Subcommands
+# ---------------------------------------------------------------------------
+
+def cmd_now(args: argparse.Namespace) -> int:
+    from pocket_watch.clock import now_info, format_compact
+
+    offset_delta = None
+    if args.offset:
+        offset_delta = _parse_offset(args.offset)
+        if offset_delta is None:
+            print(f"Invalid offset: {args.offset}. Use format like +1d, -2h, +30m", file=sys.stderr)
+            return 1
+
+    info = now_info(offset_delta=offset_delta)
+
+    if args.json:
+        print(json.dumps(info, indent=2, default=str))
+    else:
+        print(format_compact(info))
+    return 0
+
+
+def _parse_offset(s: str) -> datetime.timedelta | None:
+    """Parse an offset string like +1d, -2h, +30m into a timedelta."""
+    import re
+    m = re.fullmatch(r"([+-])(\d+(?:\.\d+)?)([dhm])", s.strip())
+    if not m:
+        return None
+    sign = 1 if m.group(1) == "+" else -1
+    qty = float(m.group(2))
+    unit = m.group(3)
+    if unit == "d":
+        return datetime.timedelta(days=sign * qty)
+    if unit == "h":
+        return datetime.timedelta(hours=sign * qty)
+    if unit == "m":
+        return datetime.timedelta(minutes=sign * qty)
+    return None
+
+
+def cmd_estimate(args: argparse.Namespace) -> int:
+    from pocket_watch.parse import parse_duration, infer_category
+    from pocket_watch.log import append_entry
+    from pocket_watch.paths import session_state_path
+
+    minutes = parse_duration(args.duration)
+    if minutes is None:
+        print(f"Cannot parse duration: {args.duration}. Try '30m', '1h', '2h30m'.", file=sys.stderr)
+        return 1
+
+    session_id = os.environ.get("POCKET_WATCH_SESSION_ID", "cli-session")
+    now_iso = datetime.datetime.utcnow().isoformat() + "Z"
+    category = args.category or "uncategorized"
+    note = args.note or ""
+    entry_id = str(uuid.uuid4())
+    project = _detect_project()
+    model = os.environ.get("CLAUDE_MODEL", "unknown")
+
+    entry = {
+        "id": entry_id,
+        "_schema": 1,
+        "session_id": session_id,
+        "who": "user",
+        "model": model,
+        "project": project,
+        "category": category,
+        "source": "manual",
+        "confidence": 0.9,
+        "estimated_at": now_iso,
+        "estimate_minutes": round(minutes, 1),
+        "started_at": now_iso,
+        "completed_at": None,
+        "active_minutes": None,
+        "elapsed_minutes": None,
+        "completion_signal": None,
+        "completion_confidence": 0.0,
+        "status": "open",
+        "notes": note[:200],
+        "audited_at": None,
+        "audit_result": None,
+        "corrected_by": None,
+        "corrects": None,
+    }
+    append_entry(entry)
+
+    # Update session state
+    sp = session_state_path(session_id)
+    state: dict = {}
+    if sp.exists():
+        try:
+            state = json.loads(sp.read_text())
+        except Exception:
+            pass
+    state["open_estimate_id"] = entry_id
+    state["active_minutes_accumulator"] = 0.0
+    try:
+        sp.write_text(json.dumps(state, indent=2))
+        sp.chmod(0o600)
+    except Exception:
+        pass
+
+    print(f"Logged estimate: {minutes:.0f}m [{category}] — id: {entry_id}")
+    return 0
+
+
+def cmd_done(args: argparse.Namespace) -> int:
+    from pocket_watch.log import append_entry, read_tail
+    from pocket_watch.paths import session_state_path
+
+    session_id = os.environ.get("POCKET_WATCH_SESSION_ID", "cli-session")
+    now_iso = datetime.datetime.utcnow().isoformat() + "Z"
+    now_dt = datetime.datetime.now(tz=datetime.timezone.utc)
+
+    # Find most recent open estimate
+    entries = read_tail(200)
+    open_entry = None
+    for entry in reversed(entries):
+        if entry.get("status") == "open":
+            open_entry = entry
+            break
+
+    if open_entry is None:
+        print("No open estimate found.", file=sys.stderr)
+        return 1
+
+    active_minutes = args.active_minutes
+    if active_minutes is None:
+        # Compute from started_at
+        started_str = open_entry.get("started_at")
+        if started_str:
+            try:
+                started = datetime.datetime.fromisoformat(started_str)
+                if started.tzinfo is None:
+                    started = started.replace(tzinfo=datetime.timezone.utc)
+                active_minutes = (now_dt - started).total_seconds() / 60.0
+            except Exception:
+                active_minutes = 0.0
+        else:
+            active_minutes = 0.0
+
+    elapsed = None
+    started_str = open_entry.get("started_at")
+    if started_str:
+        try:
+            started = datetime.datetime.fromisoformat(started_str)
+            if started.tzinfo is None:
+                started = started.replace(tzinfo=datetime.timezone.utc)
+            elapsed = (now_dt - started).total_seconds() / 60.0
+        except Exception:
+            pass
+
+    status = args.status or "completed"
+    closed_entry = dict(open_entry)
+    closed_entry["status"] = status
+    closed_entry["completed_at"] = now_iso
+    closed_entry["active_minutes"] = round(float(active_minutes), 1)
+    closed_entry["elapsed_minutes"] = round(elapsed, 1) if elapsed else None
+    closed_entry["completion_signal"] = "manual"
+    closed_entry["completion_confidence"] = 1.0
+    closed_entry["corrected_by"] = "manual-done"
+
+    append_entry(closed_entry)
+
+    # Clear session state
+    sp = session_state_path(session_id)
+    if sp.exists():
+        try:
+            state = json.loads(sp.read_text())
+            state["open_estimate_id"] = None
+            state["active_minutes_accumulator"] = 0.0
+            sp.write_text(json.dumps(state, indent=2))
+        except Exception:
+            pass
+
+    est = open_entry.get("estimate_minutes", "?")
+    print(f"Closed estimate: {est}m estimated → {active_minutes:.0f}m actual [{status}]")
+    return 0
+
+
+def cmd_stats(args: argparse.Namespace) -> int:
+    from pocket_watch.log import read_all
+    from pocket_watch.calibrate import stats_for_category, all_stats
+
+    history = read_all()
+    if not history:
+        print("No history yet. Complete some estimates to see stats.")
+        return 0
+
+    if args.category:
+        result = [stats_for_category(args.category, history)]
+    else:
+        result = all_stats(history)
+
+    if not result:
+        print("No completed estimates yet.")
+        return 0
+
+    if args.json:
+        print(json.dumps(result, indent=2))
+    else:
+        for s in result:
+            cat = s.get("category", "?")
+            n = s.get("n", 0)
+            confidence = s.get("confidence_label", "")
+            if n == 0:
+                print(f"  {cat}: no history")
+            else:
+                median = s.get("median", "?")
+                mn = s.get("min", "?")
+                mx = s.get("max", "?")
+                print(f"  {cat}: {median}m median, range {mn}–{mx}m ({confidence})")
+    return 0
+
+
+def cmd_doctor(args: argparse.Namespace) -> int:
+    import shutil
+    import subprocess
+
+    results: list[tuple[str, bool, str]] = []
+
+    # Python version
+    py_ok = sys.version_info >= (3, 9)
+    results.append(("Python ≥ 3.9", py_ok, f"Found {sys.version.split()[0]}"))
+
+    # zoneinfo
+    try:
+        import zoneinfo
+        zi_ok = True
+        zi_note = "available"
+    except ImportError:
+        zi_ok = False
+        zi_note = "not available — install 'tzdata' package or upgrade Python"
+    results.append(("zoneinfo available", zi_ok, zi_note))
+
+    # IANA detection
+    from pocket_watch.clock import _detect_iana_tz
+    iana, fallback = _detect_iana_tz()
+    results.append(("IANA timezone detected", not fallback, f"{iana}{'  (fallback=UTC)' if fallback else ''}"))
+
+    # Data dir writable
+    from pocket_watch.paths import data_dir, hook_health_path, estimates_path
+    dd = data_dir()
+    writable = os.access(dd, os.W_OK)
+    home_prefix = os.path.expanduser("~")
+    def _tildify(path: str) -> str:
+        return path.replace(home_prefix, "~") if path.startswith(home_prefix) else path
+    results.append(("Data dir writable", writable, _tildify(str(dd))))
+
+    # Log file
+    ep = estimates_path()
+    if ep.exists():
+        results.append(("estimates.jsonl exists", True, _tildify(str(ep))))
+    else:
+        results.append(("estimates.jsonl exists", True, "Will be created on first estimate"))
+
+    # Hook health
+    hp = hook_health_path()
+    if hp.exists():
+        try:
+            health = json.loads(hp.read_text())
+            for hook_name, hdata in health.items():
+                disabled = hdata.get("disabled", False)
+                failures = hdata.get("consecutive_failures", 0)
+                note = f"disabled: {hdata.get('disabled_reason', '')}" if disabled else f"ok (failures: {failures})"
+                results.append((f"Hook {hook_name}", not disabled, note))
+        except Exception:
+            results.append(("Hook health file", False, "Could not read hook-health.json"))
+
+    # pw binary collision
+    pw_paths = shutil.which("pw")
+    if pw_paths:
+        results.append(("pw namespace", False, f"Collision: 'pw' found at {_tildify(pw_paths)}. Consider using the full path: ${{CLAUDE_PLUGIN_ROOT}}/scripts/pw"))
+    else:
+        results.append(("pw namespace", True, "No collision found"))
+
+    # Enable hooks if requested
+    if args.enable_hooks:
+        if hp.exists():
+            try:
+                health = json.loads(hp.read_text())
+                for hook_name in health:
+                    health[hook_name]["disabled"] = False
+                    health[hook_name]["consecutive_failures"] = 0
+                    health[hook_name].pop("disabled_reason", None)
+                hp.write_text(json.dumps(health, indent=2))
+                print("All hooks re-enabled.")
+            except Exception as e:
+                print(f"Could not update hook-health.json: {e}", file=sys.stderr)
+
+    # Output
+    if args.json:
+        out = [{"check": r[0], "ok": r[1], "note": r[2]} for r in results]
+        print(json.dumps(out, indent=2))
+    else:
+        print("pocket-watch doctor\n")
+        all_ok = True
+        for label, ok, note in results:
+            icon = "✓" if ok else "✗"
+            print(f"  {icon} {label}: {note}")
+            if not ok:
+                all_ok = False
+        print()
+        if all_ok:
+            print("All checks passed.")
+        else:
+            print("Some checks failed — see above for remediation hints.")
+    return 0 if all(r[1] for r in results) else 1
+
+
+def cmd_audit(args: argparse.Namespace) -> int:
+    from pocket_watch.log import read_all, append_entry
+    from pocket_watch.paths import audit_log_path
+
+    if args.skip:
+        print("Audit skipped.")
+        return 0
+
+    entries = read_all()
+    unaudited = [
+        e for e in entries
+        if not e.get("audited_at")
+        and e.get("status") in ("completed", "tentative")
+    ]
+
+    if not unaudited:
+        print("No unaudited entries. All caught up!")
+        return 0
+
+    now_iso = datetime.datetime.utcnow().isoformat() + "Z"
+
+    if args.accept_all:
+        for e in unaudited:
+            e["audited_at"] = now_iso
+            e["audit_result"] = "accepted"
+            append_entry(e)
+        print(f"Accepted {len(unaudited)} entries.")
+        return 0
+
+    print(f"Reviewing {len(unaudited)} unaudited estimates.\n")
+    accepted = 0
+    corrected = 0
+
+    for e in unaudited:
+        eid = e.get("id", "?")
+        cat = e.get("category", "?")
+        est = e.get("estimate_minutes", "?")
+        actual = e.get("active_minutes", "?")
+        notes = e.get("notes", "")
+        status = e.get("status", "?")
+
+        print(f"  [{cat}] est={est}m actual={actual}m status={status}")
+        if notes:
+            print(f"  notes: {notes}")
+        print(f"  id: {eid}")
+
+        try:
+            answer = input("  Accept? [y/n/q=quit] ").strip().lower()
+        except (EOFError, KeyboardInterrupt):
+            print("\nAudit interrupted.")
+            break
+
+        if answer == "q":
+            break
+        elif answer == "y":
+            updated = dict(e)
+            updated["audited_at"] = now_iso
+            updated["audit_result"] = "accepted"
+            append_entry(updated)
+            accepted += 1
+        else:
+            updated = dict(e)
+            updated["audited_at"] = now_iso
+            updated["audit_result"] = "rejected"
+            append_entry(updated)
+            corrected += 1
+        print()
+
+    print(f"Audit complete: {accepted} accepted, {corrected} flagged.")
+    return 0
+
+
+def cmd_correct(args: argparse.Namespace) -> int:
+    from pocket_watch.log import read_all, append_entry
+
+    entries = read_all()
+    target = None
+    for e in reversed(entries):
+        if e.get("id") == args.id:
+            target = e
+            break
+
+    if target is None:
+        print(f"Entry not found: {args.id}", file=sys.stderr)
+        return 1
+
+    now_iso = datetime.datetime.utcnow().isoformat() + "Z"
+
+    if args.delete:
+        updated = dict(target)
+        updated["status"] = "deleted"
+        updated["corrected_by"] = f"manual-delete:{now_iso}"
+        append_entry(updated)
+        print(f"Marked entry {args.id} as deleted.")
+        return 0
+
+    if not args.field or not args.value:
+        print("Usage: pw correct <id> <field> <value>  or  pw correct <id> --delete", file=sys.stderr)
+        return 1
+
+    updated = dict(target)
+    # Type coerce for numeric fields
+    if args.field in ("estimate_minutes", "active_minutes", "elapsed_minutes", "confidence", "completion_confidence"):
+        try:
+            updated[args.field] = float(args.value)
+        except ValueError:
+            updated[args.field] = args.value
+    else:
+        updated[args.field] = args.value
+
+    updated["corrected_by"] = f"manual-correct:{now_iso}"
+    append_entry(updated)
+    print(f"Corrected {args.field} on entry {args.id}.")
+    return 0
+
+
+def _detect_project() -> str:
+    try:
+        import subprocess
+        result = subprocess.run(
+            ["git", "remote", "get-url", "origin"],
+            capture_output=True, text=True, timeout=2,
+        )
+        url = result.stdout.strip()
+        if url:
+            name = url.rstrip("/").split("/")[-1]
+            return name.removesuffix(".git") if hasattr(name, "removesuffix") else name.replace(".git", "")
+    except Exception:
+        pass
+    return os.path.basename(os.getcwd()) or "unknown"
+
+
+# ---------------------------------------------------------------------------
+# Argument parser
+# ---------------------------------------------------------------------------
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="pw",
+        description="pocket-watch: temporal awareness and estimate calibration",
+    )
+    sub = parser.add_subparsers(dest="command", required=True)
+
+    # now
+    p_now = sub.add_parser("now", help="Show current time context")
+    p_now.add_argument("--json", action="store_true", help="Output as JSON")
+    p_now.add_argument("--pretty", action="store_true", help="Pretty output (default)")
+    p_now.add_argument("--offset", metavar="OFFSET", help="Shift time (e.g. +1d, -2h, +30m)")
+
+    # estimate
+    p_est = sub.add_parser("estimate", help="Log a manual estimate")
+    p_est.add_argument("duration", help="Duration like 30m, 1h, 2h30m")
+    p_est.add_argument("--category", "-c", help="Task category")
+    p_est.add_argument("--note", "-n", help="Short description")
+
+    # done
+    p_done = sub.add_parser("done", help="Manually close an open estimate")
+    p_done.add_argument("active_minutes", nargs="?", type=float, help="Actual active minutes (computed if omitted)")
+    p_done.add_argument("--status", choices=["completed", "cancelled", "merged", "scope-changed"],
+                        default="completed")
+
+    # stats
+    p_stats = sub.add_parser("stats", help="Show calibration stats")
+    p_stats.add_argument("--category", "-c", help="Filter by category")
+    p_stats.add_argument("--json", action="store_true")
+
+    # doctor
+    p_doc = sub.add_parser("doctor", help="Self-diagnostic")
+    p_doc.add_argument("--enable-hooks", action="store_true", help="Re-enable auto-disabled hooks")
+    p_doc.add_argument("--json", action="store_true")
+
+    # audit
+    p_audit = sub.add_parser("audit", help="Review unaudited captures")
+    p_audit.add_argument("--skip", action="store_true", help="Skip this audit run")
+    p_audit.add_argument("--accept-all", action="store_true", help="Accept all without review")
+
+    # correct
+    p_correct = sub.add_parser("correct", help="Edit or delete an entry")
+    p_correct.add_argument("id", help="Entry UUID")
+    p_correct.add_argument("field", nargs="?", help="Field name to update")
+    p_correct.add_argument("value", nargs="?", help="New value")
+    p_correct.add_argument("--delete", action="store_true", help="Mark entry as deleted")
+
+    return parser
+
+
+def main() -> int:
+    parser = build_parser()
+    args = parser.parse_args()
+
+    dispatch = {
+        "now": cmd_now,
+        "estimate": cmd_estimate,
+        "done": cmd_done,
+        "stats": cmd_stats,
+        "doctor": cmd_doctor,
+        "audit": cmd_audit,
+        "correct": cmd_correct,
+    }
+
+    fn = dispatch.get(args.command)
+    if fn is None:
+        parser.print_help()
+        return 1
+    return fn(args)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

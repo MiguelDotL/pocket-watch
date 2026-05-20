@@ -1,0 +1,69 @@
+name: Bug report
+description: Something is broken or behaving unexpectedly
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for filing a bug report. Please include the `pw doctor` output so we can diagnose quickly.
+
+  - type: textarea
+    id: doctor
+    attributes:
+      label: pw doctor output
+      description: Run `/pw-doctor` in Claude Code and paste the full output here.
+      render: shell
+    validations:
+      required: true
+
+  - type: input
+    id: os
+    attributes:
+      label: Operating system
+      placeholder: "macOS 14.6 / Ubuntu 24.04 / Windows 11 / WSL2 Ubuntu 22.04"
+    validations:
+      required: true
+
+  - type: input
+    id: python
+    attributes:
+      label: Python version
+      description: Output of `python3 --version`
+      placeholder: "Python 3.12.4"
+    validations:
+      required: true
+
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behavior
+      placeholder: What did you expect to happen?
+    validations:
+      required: true
+
+  - type: textarea
+    id: actual
+    attributes:
+      label: Actual behavior
+      placeholder: What actually happened?
+    validations:
+      required: true
+
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Steps to reproduce
+      placeholder: |
+        1. Run `...`
+        2. ...
+        3. ...
+    validations:
+      required: true
+
+  - type: textarea
+    id: additional
+    attributes:
+      label: Additional context
+      description: Logs, screenshots, related issues, anything else useful
+    validations:
+      required: false
