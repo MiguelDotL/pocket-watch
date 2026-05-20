@@ -1,0 +1,20 @@
+{
+  "$schema": "https://anthropic.com/claude-code/marketplace.schema.json",
+  "name": "pocket-watch",
+  "description": "Temporal awareness and estimate calibration for Claude Code",
+  "owner": {
+    "name": "MiguelDotL"
+  },
+  "plugins": [
+    {
+      "name": "pocket-watch",
+      "description": "Gives Claude awareness of local time, day-part, conversational time cues, and calibrated estimates based on your own task history. Passive observation via hooks; slash commands for power-user overrides.",
+      "category": "productivity",
+      "source": {
+        "source": "github",
+        "repo": "MiguelDotL/pocket-watch"
+      },
+      "homepage": "https://github.com/MiguelDotL/pocket-watch"
+    }
+  ]
+}
