@@ -21,6 +21,7 @@ import os
 import re
 import subprocess
 import sys
+import time
 from pathlib import Path
 from typing import Optional
 
@@ -137,15 +138,52 @@ def _day_part(hour: int) -> str:
     return result
 
 
+_IANA_CACHE_TTL_SECONDS = 60 * 60  # 1 hour — long enough to skip repeated calls, short enough for travel
+
+
 def _detect_iana_tz() -> tuple[str, bool]:
     """Return (iana_name, used_fallback).
 
     Tries each step in order; returns on first success.
+    Result is cached to disk for 1 hour to avoid repeated subprocess calls
+    (timedatectl, systemsetup) and filesystem walks on repeated invocations.
     """
-    # Step 1: env var override
+    # Step 1: env var override — always wins, never cached
     env_tz = os.environ.get("POCKET_WATCH_TZ", "").strip()
     if env_tz:
         return env_tz, False
+
+    # Cache check — only valid if no env var override is in effect
+    try:
+        from pocket_watch.paths import data_dir
+        cache_path = data_dir() / ".iana_cache.json"
+        try:
+            cached = json.loads(cache_path.read_text())
+            ts = float(cached.get("ts", 0))
+            if time.time() - ts < _IANA_CACHE_TTL_SECONDS:
+                iana = cached.get("iana")
+                fallback = bool(cached.get("fallback", False))
+                if iana:
+                    return iana, fallback
+        except (FileNotFoundError, ValueError, OSError):
+            pass
+    except Exception:
+        cache_path = None  # type: ignore[assignment]
+
+    iana, fallback = _detect_iana_tz_uncached()
+
+    # Write cache (best-effort)
+    try:
+        if cache_path is not None:
+            cache_path.write_text(json.dumps({"ts": time.time(), "iana": iana, "fallback": fallback}))
+    except OSError:
+        pass
+
+    return iana, fallback
+
+
+def _detect_iana_tz_uncached() -> tuple[str, bool]:
+    """The actual detection chain. Slow — only called on cache miss."""
 
     # Step 2: Python datetime (works on Windows, macOS, Linux in most cases)
     try:
@@ -247,13 +285,46 @@ def _utc_offset_str(dt: datetime.datetime) -> str:
     return f"{sign}{hours:02d}:{minutes:02d}"
 
 
+_TZDATA_CACHE_TTL_SECONDS = 7 * 24 * 3600  # check at most once a week
+
+
 def _check_tzdata_freshness() -> Optional[str]:
-    """Return a warning string if tzdata appears stale, else None."""
+    """Return a warning string if tzdata appears stale, else None.
+
+    Result is cached to disk for 7 days because `importlib.metadata.distribution()`
+    is the slowest operation in the hot path (~21ms on a typical machine) and
+    tzdata staleness rarely changes between calls.
+    """
+    try:
+        from pocket_watch.paths import data_dir
+        cache_path = data_dir() / ".tzdata_check.json"
+        try:
+            cached = json.loads(cache_path.read_text())
+            ts = float(cached.get("ts", 0))
+            if time.time() - ts < _TZDATA_CACHE_TTL_SECONDS:
+                warn = cached.get("warn")
+                return warn if warn else None
+        except (FileNotFoundError, ValueError, OSError):
+            pass
+
+        # Cache miss or stale — run the real check
+        warn = _compute_tzdata_freshness()
+        try:
+            cache_path.write_text(json.dumps({"ts": time.time(), "warn": warn}))
+        except OSError:
+            pass
+        return warn
+    except Exception:
+        # Any unexpected failure — silently skip the warning, don't break now_info
+        return None
+
+
+def _compute_tzdata_freshness() -> Optional[str]:
+    """Actual tzdata version check. Slow — only called on cache miss."""
     try:
         import importlib.metadata
         dist = importlib.metadata.distribution("tzdata")
         version_str = dist.version  # e.g. "2024.1"
-        # Parse year from version
         year_str = version_str.split(".")[0]
         if year_str.isdigit():
             year = int(year_str)
